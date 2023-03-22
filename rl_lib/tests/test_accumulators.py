@@ -1,17 +1,10 @@
-import unittest
-
-import json
-import numpy as np
-import reverb
-
-from rl_lib.utils import build_signature
-from rl_lib.accumulators import ReverbAccumulator, MultiAgentReverbAccumulator
-
 from absl.testing import absltest
 from absl.testing import parameterized
 
 from bsuite.environments import catch
 
+from rl_lib.utils import build_signature
+from rl_lib.accumulators import ReverbAccumulator, MultiAgentReverbAccumulator
 from rl_lib.experiment import run_loop
 from rl_lib.learners import Random
 

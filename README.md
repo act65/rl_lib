@@ -10,5 +10,5 @@ There are also some replay buffers implemented using [reverb](https://github.com
 - a multi agent replay buffer,
 - a replay buffer supporting offline / prior data (from [Efficient Online Reinforcement Learning with Offline Data](https://arxiv.org/abs/2302.02948))
 
-Code is inspired in style (/ copied) by the [rlax](https://github.com/deepmind/rlax) examples.
+Code is inspired in style by (/ copied from) the [rlax](https://github.com/deepmind/rlax) examples.
 

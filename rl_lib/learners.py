@@ -6,6 +6,7 @@ import haiku as hk
 
 from jax.example_libraries import optimizers
 from rl_lib.td_operators import soft_watkins
+from rl_lib.utils import EMATree
 
 class RLAgent():
     """
@@ -134,18 +135,18 @@ class SoftWatkins(QLearner):
 class EMATargetNet(SoftWatkins):
     def __init__(self, ema_decay, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.ema_fn = hk.transform_with_state(lambda x: hk.EMAParamsTree(ema_decay)(x))
+        self.ema_fn = EMATree(ema_decay)
 
     def initial_train_state(self, key):
         state = super().initial_train_state(key)
-        _, ema_state = self.ema_fn.init(key, state['params'])
+        ema_state = self.ema_fn.init(state['params'])
         return dict(**state, ema_state=ema_state)
-    
+
     def learner_step(self, state, batch, unused_key):
-        ema_params, ema_state = self.ema_fn.apply(None, state['ema_state'], None, state['params'])
-        batch.update({'target_params': ema_params})
+        ema = self.ema_fn(state['ema_state'], state['params'])
+        batch.update({'target_params': ema})
         state = super().learner_step(state, batch, unused_key)
-        return dict(**state, ema_state=ema_state)
+        return dict(**state, ema_state=ema)
 
 class MultiActionManager():
     def __init__(self, action_spec):
@@ -157,7 +158,7 @@ class MultiActionManager():
     def get_mask(self, action):
         raise NotImplementedError
 
-class MaskedMultiAction(SoftWatkins):
+class MaskedMultiAction(EMATargetNet):
     """
     For the case where we have a single agent that is required to make multiple actions.
     Or there is some kind of structured, discrete, action space.
