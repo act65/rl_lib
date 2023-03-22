@@ -33,7 +33,7 @@ def main(unused_arg):
     # env = bandit.SimpleBandit()
     network = NN(width=FLAGS.num_hidden_units, n_dense=2, output_dims=env.action_spec().num_values)
     
-    agent = SoftWatkins(
+    agent = EMATargetNet(
         network=network,
         observation_spec=env.observation_spec(),
         learning_rate=FLAGS.learning_rate,
