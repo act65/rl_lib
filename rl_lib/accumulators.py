@@ -115,51 +115,6 @@ class ReplayWriter(Accumulator):
     def sample(self, batch_size):
         raise ValueError("ReplayWriter does not support sampling")
 
-class ReverbAccumulator(Accumulator):
-    def __init__(self, port, signature, max_size, n_multistep, batch_size=None, shuffle_buffer_size=None):
-        super().__init__(max_size=max_size)
-        self.batch_size = batch_size
-        self.shuffle_buffer_size = shuffle_buffer_size
-        self.table_name = 'online'
-        self.n_multistep = n_multistep
-        self.server_address = f"localhost:{port}"
-        self.signature = signature
-
-        self.ds = None
-
-        # id server is already running, dont try to start
-        if not is_port_in_use(port):
-            self.server = start_server(port=port, signature=self.signature, table_name=self.table_name, max_size=max_size)
-        
-        self.client = reverb.Client(self.server_address)
-        self.replay_writer = self._new_writer()
-
-    def _new_writer(self):
-        return ReplayWriter(self.client.trajectory_writer(num_keep_alive_refs=self.n_multistep), self.table_name, self.n_multistep)
-
-    def push(self, state, action, reward, discount):
-        self.replay_writer.push(state, action, reward, discount)
-
-    def sample(self, batch_size):
-        assert batch_size == self.batch_size
-
-        # delay constructing dataset until we want to sample
-        if self.ds is None:
-            self.ds = make_dataset_from_table(self.table_name, self.server_address, self.batch_size, shuffle_buffer_size=self.shuffle_buffer_size)
-
-        batch = next(iter(self.ds.take(1)))
-        return {k: jnp.array(v) for k, v in batch.data.items()}
-    
-    def is_ready(self, batch_size):
-        return self.current_size >= batch_size
-    
-    @property
-    def current_size(self):
-        return self.client.server_info()[self.table_name].current_size
-    
-    def reset(self):
-        self.replay_writer.reset()
-
 def new_table(name, signature, max_size=10000):
     return reverb.Table( 
         name=name,
@@ -187,13 +142,64 @@ def make_dataset_from_table(table_name, server_address, batch_size, shuffle_buff
 
     return ds
 
+class ReverbAccumulator(Accumulator):
+    def __init__(self, port, signature, max_size, n_multistep, batch_size=None, shuffle_buffer_size=None):
+        super().__init__(max_size=max_size)
+        self.batch_size = batch_size
+        self.shuffle_buffer_size = shuffle_buffer_size
+        self.table_name = 'online'
+        self.n_multistep = n_multistep
+        self.server_address = f"localhost:{port}"
+        self.signature = signature
+
+        self.ds = None
+
+        # id server is already running, dont try to start
+        if not is_port_in_use(port):
+            self.server = self._start_server()
+
+        self.client = reverb.Client(self.server_address)
+        self.replay_writer = self._new_writer(table_name=self.table_name)
+
+    def _new_writer(self, table_name):
+        return ReplayWriter(self.client.trajectory_writer(num_keep_alive_refs=self.n_multistep), table_name, self.n_multistep)
+
+    def _start_server(self):
+        return start_server(port=self.port, signature=self.signature, table_name=self.table_name, max_size=self.max_size)
+        
+    def _make_ds(self):
+        return make_dataset_from_table(self.table_name, self.server_address, self.batch_size, shuffle_buffer_size=self.shuffle_buffer_size)
+
+    def push(self, state, action, reward, discount):
+        self.replay_writer.push(state, action, reward, discount)
+
+    def sample(self, batch_size):
+        assert batch_size == self.batch_size
+
+        # delay constructing dataset until we want to sample
+        if self.ds is None:
+            self.ds = self._make_ds()
+
+        batch = next(iter(self.ds.take(1)))
+        return {k: jnp.array(v) for k, v in batch.data.items()}
+    
+    def is_ready(self, batch_size):
+        return self.current_size >= batch_size
+    
+    @property
+    def current_size(self):
+        return self.client.server_info()[self.table_name].current_size
+    
+    def reset(self):
+        self.replay_writer.reset()
+
 class MultiAgentReverbAccumulator(ReverbAccumulator):
     """
-    Use a different writer for each agent.
+    Use a different writer for each agent to keep their histories seperate.
     Assumes each unit id is unique per episode.
     """
-    def __init__(self, port, signature, max_size, n_multistep, batch_size=None, shuffle_buffer_size=None):
-        super().__init__(port, signature, max_size, n_multistep, batch_size, shuffle_buffer_size)
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
         self.writers = dict()
 
     def push(self, state, action, reward, discount):
@@ -206,18 +212,50 @@ class MultiAgentReverbAccumulator(ReverbAccumulator):
 
     def reset(self):
         for idx in self.writers.keys():
+            # TODO maybe we should del them?
             self.writers[idx].reset()
 
 class RLPDAccumulator(ReverbAccumulator):
-    def __init__(self, checkpoint_path='/tmp/buffer.ckpt', port=None, max_size=10000):
-        online_table = new_table(name='online', max_size=max_size)
-        offline_table = new_table(name='offline', max_size=max_size)
+    """
+    Implements [RLPD](https://arxiv.org/abs/2302.02948).
+    Aka 50:50 offline:online replay.
+    """
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # need a second writer. the ReverbAccumulator.replay_writer will push to the online table
+        self.offline_writer = self._new_writer(table_name='offline')
 
-        # checkpointer = reverb.checkpointers.DefaultCheckpointer(path=checkpoint_path)
-        server = reverb.Server(tables=[offline_table, online_table], checkpointer=None, port=port)
+    def push(self, state, action, reward, discount, table_name):
+        if table_name == 'online':
+            self.replay_writer.push(state, action, reward, discount)
+        elif table_name == 'offline':
+            self.offline_writer.push(state, action, reward, discount)
+        else:
+            raise ValueError(f"Unknown table name: {table_name}")
 
-    def push(self, data):
-        pass
+    def _make_ds(self):
+        return build_rlpd_ds(self.server_address, self.batch_size, self.shuffle_buffer_size)
+
+    def _start_server(self):
+        return start_rlpd_server(self.signature, port=self.port, max_size=self.max_size)
+
+    @property
+    def current_size(self):
+        n_online = self.client.server_info()['online'].current_size
+        n_offline = self.client.server_info()['offline'].current_size
+        return n_online + n_offline
+    
+    def reset(self):
+        self.replay_writer.reset()
+        self.offline_writer.reset()
+
+def start_rlpd_server(signature, checkpoint_path='/tmp/buffer.ckpt', port=None, max_size=10000):
+    online_table = new_table(name='online', max_size=max_size)
+    offline_table = new_table(name='offline', max_size=max_size)
+
+    # checkpointer = reverb.checkpointers.DefaultCheckpointer(path=checkpoint_path)
+    server = reverb.Server(tables=[offline_table, online_table], checkpointer=None, port=port)
+    return server
 
 def merge_ds(ds1, ds2):
     def concat(x, y):
@@ -226,7 +264,7 @@ def merge_ds(ds1, ds2):
     ds = ds.map(concat)
     return ds
 
-def get_rlpd_ds(server_address, batch_size, shuffle_buffer_size):
+def build_rlpd_ds(server_address, batch_size, shuffle_buffer_size):
     """
     This ds should yield 50:50 offline:online data
     """
@@ -240,3 +278,5 @@ def get_rlpd_ds(server_address, batch_size, shuffle_buffer_size):
     
     return merge_ds(offline_ds, online_ds)
 
+class MultiAgentRLPDAccumulator(RLPDAccumulator, MultiAgentReverbAccumulator):
+    pass
