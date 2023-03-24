@@ -2,7 +2,6 @@ import jax
 import jax.numpy as jnp
 import optax
 import rlax
-import haiku as hk
 
 from jax.example_libraries import optimizers
 from rl_lib.td_operators import soft_watkins
