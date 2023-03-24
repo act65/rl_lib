@@ -146,6 +146,7 @@ class ReverbAccumulator(Accumulator):
     def __init__(self, port, signature, max_size, n_multistep, batch_size=None, shuffle_buffer_size=None):
         super().__init__(max_size=max_size)
         self.batch_size = batch_size
+        self.port = port
         self.shuffle_buffer_size = shuffle_buffer_size
         self.table_name = 'online'
         self.n_multistep = n_multistep
@@ -241,17 +242,22 @@ class RLPDAccumulator(ReverbAccumulator):
 
     @property
     def current_size(self):
-        n_online = self.client.server_info()['online'].current_size
-        n_offline = self.client.server_info()['offline'].current_size
-        return n_online + n_offline
+        return min(*self.status())
+    
+    @property
+    def status(self):
+        info = self.client.server_info()
+        n_online = info['online'].current_size
+        n_offline = info['offline'].current_size
+        return n_online, n_offline
     
     def reset(self):
         self.replay_writer.reset()
         self.offline_writer.reset()
 
 def start_rlpd_server(signature, checkpoint_path='/tmp/buffer.ckpt', port=None, max_size=10000):
-    online_table = new_table(name='online', max_size=max_size)
-    offline_table = new_table(name='offline', max_size=max_size)
+    online_table = new_table(name='online', signature=signature, max_size=max_size)
+    offline_table = new_table(name='offline', signature=signature, max_size=max_size)
 
     # checkpointer = reverb.checkpointers.DefaultCheckpointer(path=checkpoint_path)
     server = reverb.Server(tables=[offline_table, online_table], checkpointer=None, port=port)
@@ -278,5 +284,21 @@ def build_rlpd_ds(server_address, batch_size, shuffle_buffer_size):
     
     return merge_ds(offline_ds, online_ds)
 
-class MultiAgentRLPDAccumulator(RLPDAccumulator, MultiAgentReverbAccumulator):
-    pass
+class MultiAgentRLPDAccumulator(RLPDAccumulator):
+    """
+    Finally. The accumulator I actually want to use.
+    """
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.writers = dict()
+
+    def push(self, state, action, reward, discount, table_name):
+        for idx in action.keys():
+            if (idx, table_name) not in self.writers.keys():
+                self.writers[(idx, table_name)] = self._new_writer(table_name)
+            self.writers[(idx, table_name)].push(state[idx], action[idx], reward[idx], discount[idx])
+
+    def reset(self):
+        for idx in self.writers.keys():
+            # TODO maybe we should del them?
+            self.writers[idx].reset()
