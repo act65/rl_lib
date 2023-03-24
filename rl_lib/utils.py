@@ -2,13 +2,14 @@ import tensorflow as tf
 import jax.numpy as jnp
 import flax.linen as nn
 import jax
-from functools import partial
-
 
 from jax.tree_util import tree_flatten, tree_unflatten, tree_map
 import socket
 
 def build_signature(obs_spec, action_spec, n_multistep):
+    """"
+    Util for building the tf signature of the bsuite envs.
+    """
     base_shape = tuple(s for s in (n_multistep, ))
 
     return {
@@ -18,7 +19,6 @@ def build_signature(obs_spec, action_spec, n_multistep):
         'discounts': tf.TensorSpec(shape=base_shape+(), dtype=tf.float32),
         'next_states': tf.TensorSpec(shape=base_shape+obs_spec.shape, dtype=obs_spec.dtype),
     }
-
 
 class NN(nn.Module):
     n_dense: int
@@ -37,17 +37,6 @@ class NN(nn.Module):
         qs = nn.Dense(features=self.output_dims)(x)
         return qs
 
-# def build_network(num_hidden_units: int, num_actions: int) -> hk.Transformed:
-#     """Factory for a network for Q-values."""
-#     def q(obs):
-#         flatten = lambda x: jnp.reshape(x, (-1,))
-#         network = hk.Sequential(
-#             [flatten, nets.MLP([num_hidden_units, num_actions])])
-    
-#         return network(obs)
-
-#     return hk.without_apply_rng(hk.transform(q))
-
 def is_port_in_use(port: int) -> bool:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         return s.connect_ex(('localhost', port)) == 0
@@ -64,17 +53,26 @@ class EMA():
 class EMATree():
     def __init__(self, ema_decay):
         self.ema_fn = EMA(ema_decay)
-        # self.__call__ = jax.jit(self.__call__)
 
     def init(self, tree):
         return tree
         
     def __call__(self, value, state):
-        flat_state, tree_state = tree_flatten(state)
-        flat_value, tree_value = tree_flatten(value)
+        flat_state, _ = tree_flatten(state)
+        flat_value, tree_struct = tree_flatten(value)
 
         # check trees are the same
         # assert tree_structure_a == tree_structure_b
 
         flat_avg = map(lambda x: self.ema_fn(x[0], x[1]), zip(flat_state, flat_value))
-        return tree_unflatten(tree_value, flat_avg)
+        return tree_unflatten(tree_struct, flat_avg)
+    
+def cost(error):
+    """
+    A cost function.
+    Includes;
+    - cubic errors cos they are supposed to be equivalent to proiority replay sampling (w mse of td error). ([ref](https://arxiv.org/abs/2007.09569))
+    - abs errors cos they will ensure progress in v flat regions.
+    - squared errors cos.
+    """
+    return (jnp.mean(jnp.abs(error)) + jnp.mean(jnp.abs(error)**2) + jnp.mean(jnp.abs(error)**3))/3

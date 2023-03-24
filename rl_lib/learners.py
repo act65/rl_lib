@@ -6,7 +6,7 @@ import haiku as hk
 
 from jax.example_libraries import optimizers
 from rl_lib.td_operators import soft_watkins
-from rl_lib.utils import EMATree
+from rl_lib.utils import EMATree, cost
 
 class RLAgent():
     """
@@ -62,8 +62,6 @@ class QLearner(RLAgent):
         self._learing_rate = learning_rate
         self._optimizer = optax.adam(learning_rate)
         
-        # self._loss = jax.vmap(self._loss, in_axes=(None, None, 0, 0, 0, 0, 0, None))
-
         # Jitting for speed.
         self.actor_step = jax.jit(self.actor_step)
         self.learner_step = jax.jit(self.learner_step)
@@ -95,7 +93,7 @@ class QLearner(RLAgent):
         else:
             target_qs = self._batch_apply_net(target_params, next_states)
         td_error = self._td_operator(q_s, actions, rewards, discounts, target_qs)
-        return jnp.mean(td_error**2)
+        return cost(td_error)
     
     def _td_operator(self, q_tm1, a_t, r_t, discount_t, q_t):
         q_learning = jax.vmap(rlax.q_learning, in_axes=(0, 0, 0, 0, 0))
@@ -126,7 +124,7 @@ class SoftWatkins(QLearner):
         else:
             target_qs = jax.lax.map(lambda obs: self._batch_apply_net(target_params, obs), next_states)
         td_error = self._td_operator(q_s, actions, rewards, discounts, target_qs)
-        return jnp.mean(td_error**2)
+        return cost(td_error)
     
     def _td_operator(self, q_s, a_s, r_s, discount_s, target_qs):
         batch_soft_watkins = jax.vmap(soft_watkins, in_axes=(0, 0, 0, 0, 0, None, None))
@@ -144,7 +142,7 @@ class EMATargetNet(SoftWatkins):
 
     def learner_step(self, state, batch, unused_key):
         ema = self.ema_fn(state['ema_state'], state['params'])
-        batch.update({'target_params': ema})
+        batch.update({'target_params': ema})  # the 'batch' args are passed to _loss
         state = super().learner_step(state, batch, unused_key)
         return dict(**state, ema_state=ema)
 
@@ -194,6 +192,6 @@ class MaskedMultiAction(EMATargetNet):
 
         for i, (q, target_q) in enumerate(zip(self.mam.iterate(q_s), self.mam.iterate(target_qs))):
             td_error = self._td_operator(q, actions[..., i], rewards, discounts, target_q)
-            loss += jnp.sum(td_error * mask[..., i])
+            loss += cost(td_error * mask[..., i])
 
         return loss
