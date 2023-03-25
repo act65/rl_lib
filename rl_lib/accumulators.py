@@ -143,7 +143,7 @@ def make_dataset_from_table(table_name, server_address, batch_size, shuffle_buff
     return ds
 
 class ReverbAccumulator(Accumulator):
-    def __init__(self, port, signature, max_size, n_multistep, batch_size=None, shuffle_buffer_size=None):
+    def __init__(self, port, signature, max_size, n_multistep, batch_size=None, shuffle_buffer_size=None, start_server=True):
         super().__init__(max_size=max_size)
         self.batch_size = batch_size
         self.port = port
@@ -156,7 +156,7 @@ class ReverbAccumulator(Accumulator):
         self.ds = None
 
         # id server is already running, dont try to start
-        if not is_port_in_use(port):
+        if start_server and not is_port_in_use(port):
             self.server = self._start_server()
 
         self.client = reverb.Client(self.server_address)
@@ -240,9 +240,19 @@ class RLPDAccumulator(ReverbAccumulator):
     def _start_server(self):
         return start_rlpd_server(self.signature, port=self.port, max_size=self.max_size)
 
+    def sample(self, batch_size):
+        assert batch_size == self.batch_size
+
+        # delay constructing dataset until we want to sample
+        if self.ds is None:
+            self.ds = self._make_ds()
+
+        batch = next(iter(self.ds.take(1)))
+        return {k: jnp.array(v) for k, v in batch.items()}
+
     @property
     def current_size(self):
-        return min(*self.status())
+        return min(*self.status)
     
     @property
     def status(self):
