@@ -3,7 +3,7 @@ import jax.numpy as jnp
 import flax.linen as nn
 import jax
 
-from jax.tree_util import tree_flatten, tree_unflatten, tree_map
+from jax.tree_util import tree_flatten, tree_unflatten, tree_leaves
 import socket
 
 def build_signature(obs_spec, action_spec, n_multistep):
@@ -28,12 +28,12 @@ class NN(nn.Module):
     @nn.compact
     def __call__(self, x):
         x = jnp.reshape(x, -1)
-        for _ in range(self.n_dense):
+        for _ in range(self.n_dense-1):
             x = nn.Dense(
                 features=self.width,
                 kernel_init=jax.nn.initializers.orthogonal()
                 )(x)
-            x = nn.selu(x)
+            x = nn.relu(x)
         qs = nn.Dense(features=self.output_dims)(x)
         return qs
 
@@ -75,4 +75,17 @@ def cost(error):
     - abs errors cos they will ensure progress in v flat regions.
     - squared errors cos.
     """
-    return (jnp.mean(jnp.abs(error)) + jnp.mean(jnp.abs(error)**2) + jnp.mean(jnp.abs(error)**3))/3
+    return (
+        jnp.mean(jnp.abs(error))
+        +jnp.mean(jnp.abs(error)**2) 
+        +jnp.mean(jnp.abs(error)**3)
+        )/3
+
+def l2_loss(x, alpha):
+    return alpha * (x ** 2).mean()
+
+def l2_regulariser(params):
+    return sum(
+        l2_loss(w, alpha=0.001) 
+        for w in tree_leaves(params)
+    )
