@@ -5,7 +5,7 @@ import rlax
 
 from jax.example_libraries import optimizers
 from rl_lib.td_operators import soft_watkins
-from rl_lib.utils import EMATree, cost
+from rl_lib.utils import EMATree, cost, l2_regulariser
 
 class RLAgent():
     """
@@ -25,7 +25,7 @@ class RLAgent():
     def actor_step(self):
         raise NotImplementedError
 
-    def learner_step(self, params, data, learner_state, unused_key):
+    def learner_step(self, params, data, train_state, unused_key):
         raise NotImplementedError
 
 class Random(RLAgent):
@@ -47,7 +47,7 @@ class Random(RLAgent):
 
     def learner_step(self, train_state, data, key):
         del data, key
-        return train_state
+        return train_state, 0.0
 
 class QLearner(RLAgent):
     """
@@ -92,28 +92,27 @@ class QLearner(RLAgent):
         else:
             target_qs = self._batch_apply_net(target_params, next_states)
         td_error = self._td_operator(q_s, actions, rewards, discounts, target_qs)
-        return cost(td_error)
+        return cost(td_error) + l2_regulariser(params)
     
     def _td_operator(self, q_tm1, a_t, r_t, discount_t, q_t):
         q_learning = jax.vmap(rlax.q_learning, in_axes=(0, 0, 0, 0, 0))
         return q_learning(q_tm1, a_t, r_t, discount_t, q_t)
 
     def learner_step(self, state, batch, unused_key):
-        grad_fn = jax.grad(self._loss)
-        grads = grad_fn(state['params'], **batch)
+        grad_fn = jax.value_and_grad(self._loss)
+        loss, grads = grad_fn(state['params'], **batch)
         grads = optimizers.clip_grads(grads, 1.0)
         updates, opt_state = self._optimizer.update(grads, state['opt_state'])
         new_params = optax.apply_updates(state['params'], updates)
         return dict(
             params=new_params, 
-            opt_state=opt_state)
+            opt_state=opt_state), loss
 
-class SoftWatkins(QLearner):
+class QLambda(QLearner):
     """
     """
-    def __init__(self, network, observation_spec, learning_rate, kappa, _lambda ):
-        super().__init__(network, observation_spec, learning_rate,)
-        self.kappa = kappa
+    def __init__(self, _lambda, *args, **kwargs):
+        super().__init__(*args, **kwargs)
         self._lambda = _lambda  
    
     def _loss(self, params, states, actions, rewards, discounts, next_states, target_params=None):
@@ -123,8 +122,20 @@ class SoftWatkins(QLearner):
         else:
             target_qs = jax.lax.map(lambda obs: self._batch_apply_net(target_params, obs), next_states)
         td_error = self._td_operator(q_s, actions, rewards, discounts, target_qs)
-        return cost(td_error)
+        return cost(td_error) + l2_regulariser(params)
     
+    def _td_operator(self, q_s, a_s, r_s, discount_s, target_qs):
+        _lambda = jnp.ones_like(discount_s)
+        batch_soft_watkins = jax.vmap(rlax.q_lambda, in_axes=(0, 0, 0, 0, 0, 0))
+        return batch_soft_watkins(q_s, a_s, r_s, discount_s, target_qs, _lambda)
+
+class SoftWatkins(QLambda):
+    """
+    """
+    def __init__(self, kappa, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.kappa = kappa
+
     def _td_operator(self, q_s, a_s, r_s, discount_s, target_qs):
         batch_soft_watkins = jax.vmap(soft_watkins, in_axes=(0, 0, 0, 0, 0, None, None))
         return batch_soft_watkins(q_s, a_s, r_s, discount_s, target_qs, self.kappa, self._lambda)
@@ -142,8 +153,8 @@ class EMATargetNet(SoftWatkins):
     def learner_step(self, state, batch, unused_key):
         ema = self.ema_fn(state['ema_state'], state['params'])
         batch.update({'target_params': ema})  # the 'batch' args are passed to _loss
-        state = super().learner_step(state, batch, unused_key)
-        return dict(**state, ema_state=ema)
+        state, loss = super().learner_step(state, batch, unused_key)
+        return dict(**state, ema_state=ema), loss
 
 class MultiActionManager():
     def __init__(self, action_spec):
@@ -186,11 +197,11 @@ class MaskedMultiAction(EMATargetNet):
         else:
             target_qs = jax.lax.map(lambda obs: self._batch_apply_net(target_params, obs), next_states)
 
-        loss = 0
+        loss = 0.0
         mask = jax.vmap(self.mam.get_mask)(actions)
 
         for i, (q, target_q) in enumerate(zip(self.mam.iterate(q_s), self.mam.iterate(target_qs))):
             td_error = self._td_operator(q, actions[..., i], rewards, discounts, target_q)
             loss += cost(td_error * mask[..., i])
 
-        return loss
+        return loss + l2_regulariser(params)
