@@ -207,7 +207,7 @@ class MultiAgentReverbAccumulator(ReverbAccumulator):
         for idx in action.keys():
             # maybe add unit_id to 
             if idx not in self.writers.keys():
-                self.writers[idx] = self._new_writer()
+                self.writers[idx] = self._new_writer(self.table_name)
 
             self.writers[idx].push(state[idx], action[idx], reward[idx], discount[idx])
 
