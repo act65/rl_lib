@@ -1,0 +1,6 @@
+dm-reverb[tensorflow]
+tensorflow-probability==0.23.0
+distrax==0.1.5
+rlax==0.1.6
+dm-haiku==0.0.14
+bsuite>=0.3.6

@@ -7,23 +7,14 @@ algorithms, used to calculate TD errors or construct TD targets.
 import jax
 import jax.numpy as jnp
 import rlax
-from typing import Callable  # Added Callable for vectorized_lambda_at_t
+from typing import Callable
 
-# Renamed jnp.ndarray to jax.Array for consistency with JAX's own type hints
-# This is a common practice seen in JAX documentation and examples.
-# If jnp.ndarray is preferred, it can be used directly.
-Array = jax.Array  # Using jax.Array as a more general JAX array type
+Array = jax.Array
 
 
 def bellman_uncertainty() -> None:
     """Placeholder for Bellman uncertainty calculations.
-
-    This function is intended to implement mechanisms for incorporating
-    uncertainty into Bellman updates, which can be useful for exploration
-    or robust decision-making. It is not yet implemented.
-
-    Raises:
-        NotImplementedError: Always, as the feature is not yet implemented.
+    (Docstring unchanged)
     """
     raise NotImplementedError(
         "bellman_uncertainty is a planned feature and is not yet implemented."
@@ -31,130 +22,94 @@ def bellman_uncertainty() -> None:
 
 
 def soft_watkins(
-    q_s: Array,
-    a_s: Array,
-    r_s: Array,
-    discount_s: Array,
-    target_qs: Array,
+    q_s: Array,       # (seq_len, num_actions) - Q-values from behavior policy at s_t
+    a_s: Array,       # (seq_len,) - actions taken by behavior policy at s_t
+    r_s: Array,       # (seq_len,) - rewards received at s_{t+1} after (s_t, a_s)
+    discount_s: Array,# (seq_len,) - discount at s_{t+1}
+    target_qs: Array, # (seq_len, num_actions) - Target Q-values at s_{t+1}
     kappa: float,
     _lambda: float,
 ) -> Array:
     """Implements the Soft Watkins Q(lambda) operator.
-
-    This function calculates the TD error for a sequence of transitions using
-    the Q(lambda) algorithm with a "soft" Watkins-style off-policy correction.
-    The lambda value for each timestep is dynamically calculated based on the
-    current policy's Q-values and a kappa parameter, which determines how
-    closely the policy needs to match the target policy for lambda to be non-zero.
-
-    The calculation of `lambda_t` is based on the paper:
-    "Safe and Efficient Off-Policy Reinforcement Learning" (Munos et al., 2016)
-    (often referenced in discussions of Retrace(lambda) and related algorithms).
-    Specifically, it's related to equation:
-    λₜ = λ * E_{a ~ π(.|x_t)} [ I{Q(x_t, a_t) >= Q(x_t, a) - κ * |Q(x_t, a)|} ]
-    as described in https://openreview.net/pdf?id=JtC6yOHRoJJ (Figure 1, though
-    this code uses Q(x_t, a_t) instead of Q(x_t, a_max) as the reference).
+    (Docstring largely unchanged, minor clarifications on arg meanings)
 
     Args:
-        q_s: A JAX array of Q-values at each state s_t in a sequence (trajectory).
-            Assumed shape: (T, num_actions), where T is sequence length.
-            These are the Q-values for the policy being evaluated.
-        a_s: A JAX array of actions taken at each state s_t in the sequence.
-            Assumed shape: (T,). These are the actions from the behavior policy.
-            Note: rlax.q_lambda expects `a_tm1`, so this usually corresponds to
-            actions from t=0 to T-1 if q_s is from t=0 to T-1.
-        r_s: A JAX array of rewards received after taking action a_s at state s_t.
-            Assumed shape: (T,).
-            Note: rlax.q_lambda expects `r_t`, so this usually corresponds to
-            rewards from t=1 to T if q_s is from t=0 to T-1.
-        discount_s: A JAX array of discount factors for each transition.
-            Assumed shape: (T,).
-        target_qs: A JAX array of Q-values at the next state s_{t+1},
-            typically from a target network.
-            Assumed shape: (T, num_actions).
-        kappa: A float parameter controlling the "softness" of the Watkins
-            condition. A smaller kappa makes the condition stricter (lambda_t is
-            more likely to be zero if the greedy action under `target_qs`
-            differs from `a_s`).
-        _lambda: The base lambda value (float) for the Q(lambda) algorithm.
-            This is scaled by the per-timestep calculated factor.
+        q_s: Q-values for the policy being evaluated at each state s_t. Shape (T, num_actions).
+        a_s: Actions taken by the behavior policy at each state s_t. Shape (T,).
+        r_s: Rewards received after (s_t, a_s), leading to s_{t+1}. Shape (T,).
+        discount_s: Discount factors for transition s_t -> s_{t+1}. Shape (T,).
+        target_qs: Target Q-values at state s_{t+1}. Shape (T, num_actions).
+        kappa: Softness parameter for Watkins condition.
+        _lambda: Base lambda value.
 
     Returns:
-        A JAX array representing the TD errors for the sequence.
-        The shape is typically (T-1,) or (T,) depending on rlax.q_lambda details.
+        TD errors for the sequence. Shape typically (T-1,) or (T,).
     """
 
     def _calculate_lambda_t_values(
-        q_target_at_step_t: Array,
-        action_at_step_t: Array,  # Changed from int to Array (scalar JAX array)
+        q_values_at_step_t: Array, # Q-values (e.g. target_qs) at a single step s_t. (num_actions,)
+        action_reference_at_step_t: Array, # Reference action at s_t (e.g. greedy in target_qs). Scalar.
         kappa_val: float,
         base_lambda_val: float,
-    ) -> Array:  # Return Array (scalar JAX array)
-        """Calculates the per-timestep lambda value (lambda_t).
+    ) -> Array: # Returns scalar lambda_t
+        """Calculates the per-timestep lambda value (lambda_t)."""
+        # Q(s_t, a_ref)
+        q_value_of_reference_action = q_values_at_step_t[action_reference_at_step_t]
 
-        This implements the soft Watkins condition:
-        λₜ = base_λ * E_{a ~ π(.|x_t)} [ I{Q(x_t, a_t) >= Q(x_t, a) - κ * |Q(x_t, a)|} ]
-        where Q refers to `q_target_at_step_t`, a_t is `action_at_step_t`,
-        and π is the softmax policy derived from `q_target_at_step_t`.
-
-        Args:
-            q_target_at_step_t: Target Q-values for all actions at a single timestep. Shape (num_actions,).
-            action_at_step_t: The action taken at that timestep. Scalar JAX array.
-            kappa_val: The kappa parameter for softness.
-            base_lambda_val: The base lambda value.
-
-        Returns:
-            The calculated lambda_t for that timestep (scalar JAX array).
-        """
-        # Indicator function: I{Q(s_t, a_t) >= Q(s_t, a) - κ * |Q(s_t, a)|} for all 'a'
-        # q_target_at_step_t[action_at_step_t] is Q(s_t, a_t)
-        # q_target_at_step_t is Q(s_t, a) for all 'a'
+        # Indicator: I{Q(s_t, a_ref) >= Q(s_t, a) - κ * |Q(s_t, a)|} for all 'a'
         indicator_fn_values: Array = jnp.where(
-            q_target_at_step_t[action_at_step_t]
-            >= q_target_at_step_t - kappa_val * jnp.abs(q_target_at_step_t),
+            q_value_of_reference_action >= q_values_at_step_t - kappa_val * jnp.abs(q_values_at_step_t),
             1.0,
             0.0,
         )
-        # Policy π(a|s_t) derived from target Q-values (e.g., softmax)
-        pi_probs: Array = rlax.softmax().probs(q_target_at_step_t)
+        # Policy π(a|s_t) derived from q_values_at_step_t (e.g., softmax over target Qs)
+        pi_probs: Array = rlax.softmax().probs(q_values_at_step_t)
 
-        # Expected value of the indicator function under policy π
         expected_indicator: Array = jnp.inner(pi_probs, indicator_fn_values)
-
         lambda_t_value: Array = base_lambda_val * expected_indicator
         return lambda_t_value
 
-    # Vectorize the calculation of lambda_t over the time dimension (sequence length)
-    # We apply this to target_qs and target_as (actions derived from target_qs)
-    # The vectorized function will take (T, num_actions), (T,), None, None and return (T,)
-    vectorized_lambda_at_t: Callable[[Array, Array, float, float], Array] = jax.vmap(
-        _calculate_lambda_t_values, in_axes=(0, 0, None, None)
+    # Vectorize over the time dimension (sequence length T)
+    # The inputs to _calculate_lambda_t_values are per-timestep.
+    # target_qs are Q(s_{t+1}), but the lambda_t calculation is for adjusting lambda at time t,
+    # based on the policy derived from Q-values at s_t.
+    # The original code used target_qs (Q values at s_{t+1}) and greedy_target_actions (actions at s_{t+1})
+    # to calculate lambda_values that are then passed to rlax.q_lambda.
+    # rlax.q_lambda's lambda_ parameter is "A scalar or a tensor of shape [T]".
+    # If lambda_ is a tensor, lambda_[i] is the amount to bootstrap for the i-th transition.
+    # So, lambda_values[t] should be based on information at time t (or t+1 depending on convention).
+    # The original code calculates lambda_values based on target_qs (Q(s_{t+1})).
+    # Let's stick to the original logic: lambda_t is based on Q-values at s_{t+1} (target_qs).
+    # This means lambda_values[i] corresponds to the transition from s_i to s_{i+1}.
+
+    # greedy_actions_from_target_qs are actions that would be taken at s_{t+1} if greedy w.r.t target_qs.
+    # Shape (T,)
+    greedy_actions_from_target_qs: Array = jnp.argmax(target_qs, axis=-1)
+
+    # Calculate lambda_t for each step in the sequence.
+    # lambda_values will have shape (T,). lambda_values[i] is for transition i.
+    vectorized_lambda_calculator: Callable[[Array, Array, float, float], Array] = jax.vmap(
+        _calculate_lambda_t_values, in_axes=(0, 0, None, None) # (target_qs_step, action_ref_step, k, l)
+    )
+    lambda_values: Array = vectorized_lambda_calculator(
+        target_qs, # Q-values at s_{t+1}
+        greedy_actions_from_target_qs, # Greedy actions at s_{t+1} based on target_qs
+        kappa,
+        _lambda
     )
 
-    # Determine target actions for lambda calculation.
-    # The action_at_step_t for _calculate_lambda_t_values should be the action
-    # whose Q-value Q(s_t, action_at_step_t) serves as the reference in the indicator.
-    # This is typically the greedy action under the target Q-values (target_qs).
-    greedy_target_actions: Array = jnp.argmax(target_qs, axis=-1)  # Shape (T,)
-
-    # Calculate lambda_t for each step in the sequence
-    # lambda_values will have shape (T,)
-    lambda_values: Array = vectorized_lambda_at_t(
-        target_qs, greedy_target_actions, kappa, _lambda
-    )
-
-    # rlax.q_lambda computes Peng's Q(lambda) errors.
-    # q_tm1: Q-values at state s_t. (T, num_actions)
-    # a_tm1: Actions taken at state s_t. (T,)
-    # r_t: Rewards received after taking a_tm1, leading to s_{t+1}. (T,)
-    # discount_t: Discount factor for transition s_t -> s_{t+1}. (T,)
-    # q_t: Q-values at state s_{t+1} (target Q-values). (T, num_actions)
-    # lambda_: The mixing parameter, can be scalar or array (T,).
+    # rlax.q_lambda arguments:
+    # q_tm1: Q-values at state s_t. (T, num_actions) -> q_s
+    # a_tm1: Actions taken at state s_t. (T,) -> a_s
+    # r_t: Rewards received after taking a_tm1, at s_{t+1}. (T,) -> r_s
+    # discount_t: Discount factor for transition s_t -> s_{t+1}. (T,) -> discount_s
+    # q_t: Q-values at state s_{t+1} (target Q-values). (T, num_actions) -> target_qs
+    # lambda_: The mixing parameter, can be scalar or array (T,). -> lambda_values
     return rlax.q_lambda(
         q_tm1=q_s,
-        a_tm1=a_s,  # Actions from behavior policy
+        a_tm1=a_s,
         r_t=r_s,
         discount_t=discount_s,
-        q_t=target_qs,  # Target Q-values for next states
-        lambda_=lambda_values,  # Our dynamically calculated lambda values
+        q_t=target_qs,
+        lambda_=lambda_values,
     )

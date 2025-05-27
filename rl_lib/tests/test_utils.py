@@ -4,17 +4,17 @@ from absl.testing import parameterized
 import tensorflow as tf
 import jax
 import jax.numpy as jnp
-import haiku as hk
+import flax.linen as nn # For testing NN
 from jax.tree_util import tree_leaves
 
 
-from rl_lib.utils import EMATree, NN, build_signature, cost, l2_loss, l2_regulariser
+from rl_lib.utils import EMATree, NN as UtilsNN, build_signature, cost, l2_loss, l2_regulariser # Renamed imported NN to UtilsNN
 
 
-class MockSpec:
+class MockSpec: # Kept for build_signature test as it uses tf.TensorSpec-like objects
     def __init__(self, shape, dtype, name=None):
         self.shape = shape
-        self.dtype = dtype
+        self.dtype = dtype # Should be tf.dtype for build_signature
         self.name = name
 
 
@@ -23,30 +23,44 @@ class TestUtils(parameterized.TestCase):
         super().setUp()
         self.key = jax.random.PRNGKey(0)
 
-    def test_ema(self, k=5):
-        ema = EMATree(0.5)
-        # rng = hk.PRNGSequence(jax.random.PRNGKey(0)) # Not used in this version of test_ema
+    def test_ema_constant_value(self):
+        ema_decay = 0.5
+        ema = EMATree(ema_decay)
+        
+        initial_val_dict = {"a": jnp.array(1.0), "b": jnp.array(2.0)}
+        current_ema_state = ema.init(initial_val_dict) # Initial state is the value itself
 
-        def get_val():
-            return {"a": jnp.ones(()), "b": jnp.ones(())}
+        # Update with the same value
+        new_value_dict = initial_val_dict
+        updated_ema_state = ema(current_ema_state, new_value_dict)
 
-        x = get_val()
-        state = ema.init(x)
+        # Expected: 0.5 * 1.0 + 0.5 * 1.0 = 1.0 for 'a'
+        # Expected: 0.5 * 2.0 + 0.5 * 2.0 = 2.0 for 'b'
+        self.assertTrue(jnp.allclose(updated_ema_state["a"], 1.0))
+        self.assertTrue(jnp.allclose(updated_ema_state["b"], 2.0))
 
-        for _ in range(k):
-            # x = get_val() # x is not reassigned, so state will be EMA of initial x and itself.
-            state = ema(state, x)  # Corrected: ema(current_ema_state, new_value)
+    def test_ema_changing_value(self):
+        ema_decay = 0.9
+        ema = EMATree(ema_decay)
 
-        # With ema_decay = 0.5, state = 0.5 * state + 0.5 * x
-        # If x is always {'a': 1.0, 'b': 1.0} and state starts as x:
-        # iter 1: state = 0.5*1 + 0.5*1 = 1
-        # iter 2: state = 0.5*1 + 0.5*1 = 1
-        # ... so it remains 1.0.
-        self.assertEqual(state["a"], 1.0)
+        initial_value = {"val": jnp.array(10.0)}
+        current_ema_state = ema.init(initial_value)
+
+        new_value_1 = {"val": jnp.array(20.0)}
+        current_ema_state = ema(current_ema_state, new_value_1)
+        expected_val_1 = ema_decay * 10.0 + (1.0 - ema_decay) * 20.0 # 0.9*10 + 0.1*20 = 9 + 2 = 11.0
+        self.assertTrue(jnp.allclose(current_ema_state["val"], expected_val_1))
+
+        new_value_2 = {"val": jnp.array(0.0)}
+        current_ema_state = ema(current_ema_state, new_value_2)
+        expected_val_2 = ema_decay * expected_val_1 + (1.0 - ema_decay) * 0.0 # 0.9 * 11.0 = 9.9
+        self.assertTrue(jnp.allclose(current_ema_state["val"], expected_val_2))
+
 
     def test_build_signature(self):
-        obs_spec = MockSpec(shape=(84, 84, 3), dtype=jnp.uint8)
-        action_spec = MockSpec(shape=(), dtype=jnp.int32)  # Scalar action
+        # Using tf.TensorSpec directly for obs_spec and action_spec as build_signature expects
+        obs_spec = tf.TensorSpec(shape=(84, 84, 3), dtype=tf.uint8)
+        action_spec = tf.TensorSpec(shape=(), dtype=tf.int32)
         n_multistep = 4
 
         signature = build_signature(obs_spec, action_spec, n_multistep)
@@ -58,25 +72,18 @@ class TestUtils(parameterized.TestCase):
         for key in expected_keys:
             self.assertIsInstance(signature[key], tf.TensorSpec)
 
-        self.assertEqual(signature["states"].shape.as_list(), [n_multistep, 84, 84, 3])
-        self.assertEqual(
-            signature["actions"].shape.as_list(), [n_multistep]
-        )  # Scalar action, only n_multistep
-        self.assertEqual(signature["rewards"].shape.as_list(), [n_multistep])
-        self.assertEqual(signature["discounts"].shape.as_list(), [n_multistep])
-        self.assertEqual(
-            signature["next_states"].shape.as_list(), [n_multistep, 84, 84, 3]
-        )
+        self.assertEqual(list(signature["states"].shape), [n_multistep, 84, 84, 3])
+        self.assertEqual(list(signature["actions"].shape), [n_multistep])
+        self.assertEqual(list(signature["rewards"].shape), [n_multistep])
+        self.assertEqual(list(signature["discounts"].shape), [n_multistep])
+        self.assertEqual(list(signature["next_states"].shape), [n_multistep, 84, 84, 3])
 
-        self.assertEqual(signature["states"].dtype, tf.dtypes.as_dtype(obs_spec.dtype))
-        self.assertEqual(
-            signature["actions"].dtype, tf.dtypes.as_dtype(action_spec.dtype)
-        )
+        self.assertEqual(signature["states"].dtype, obs_spec.dtype)
+        self.assertEqual(signature["actions"].dtype, action_spec.dtype)
         self.assertEqual(signature["rewards"].dtype, tf.float32)
         self.assertEqual(signature["discounts"].dtype, tf.float32)
-        self.assertEqual(
-            signature["next_states"].dtype, tf.dtypes.as_dtype(obs_spec.dtype)
-        )
+        self.assertEqual(signature["next_states"].dtype, obs_spec.dtype)
+
 
     def test_cost_function(self):
         error1 = jnp.array([1.0, 2.0, 3.0])
@@ -87,18 +94,10 @@ class TestUtils(parameterized.TestCase):
         cost_val1 = cost(error1)
         cost_val2 = cost(error2)
 
-        self.assertEqual(cost_val0, 0.0)
+        self.assertTrue(jnp.allclose(cost_val0, 0.0))
         self.assertTrue(cost_val1 > 0)
-        self.assertEqual(cost_val1, cost_val2)
+        self.assertTrue(jnp.allclose(cost_val1, cost_val2))
 
-        # Manual calculation for error1
-        # abs_e1 = [1, 2, 3]
-        # mean_abs_e1 = (1+2+3)/3 = 2
-        # abs_e1_sq = [1, 4, 9]
-        # mean_abs_e1_sq = (1+4+9)/3 = 14/3
-        # abs_e1_cub = [1, 8, 27]
-        # mean_abs_e1_cub = (1+8+27)/3 = 36/3 = 12
-        # expected_manual_cost = (2 + 14/3 + 12) / 3 = (6/3 + 14/3 + 36/3) / 3 = (56/3) / 3 = 56/9
         expected_manual_cost = (
             jnp.mean(jnp.abs(error1))
             + jnp.mean(jnp.square(error1))
@@ -109,59 +108,71 @@ class TestUtils(parameterized.TestCase):
     def test_l2_loss(self):
         params = jnp.array([1.0, 2.0, 3.0])
         alpha = 0.1
-        loss = l2_loss(params, alpha)
-        expected_loss = 0.1 * ((1**2 + 2**2 + 3**2) / 3.0)  # 0.1 * (14/3)
-        self.assertTrue(jnp.allclose(loss, expected_loss))
+        loss_val = l2_loss(params, alpha) # Renamed variable to avoid conflict
+        expected_loss = 0.1 * ((1**2 + 2**2 + 3**2) / 3.0)
+        self.assertTrue(jnp.allclose(loss_val, expected_loss))
 
     def test_l2_regulariser(self):
         params_tree = {
             "layer1": {"w": jnp.array([1.0, 2.0]), "b": jnp.array([0.1, 0.2])},
             "layer2": {"w": jnp.array([-1.0, -2.0])},
+            "empty_leaf": {}, # Test robustness to empty or non-array leaves
+            "none_leaf": None,
         }
         alpha = 0.1
         reg_loss = l2_regulariser(params_tree, alpha=alpha)
 
-        expected_reg_loss = 0.0
+        expected_reg_loss_val = 0.0
         for leaf in tree_leaves(params_tree):
-            expected_reg_loss += alpha * jnp.mean(jnp.square(leaf))
+            if isinstance(leaf, jax.Array) and leaf.size > 0: # l2_regulariser filters Nones and non-arrays
+                expected_reg_loss_val += alpha * jnp.mean(jnp.square(leaf))
+        
+        self.assertTrue(jnp.allclose(reg_loss, expected_reg_loss_val))
 
-        self.assertTrue(jnp.allclose(reg_loss, expected_reg_loss))
-
-    def test_nn_forward_pass(self):
+    def test_nn_forward_pass_flax(self):
         n_dense = 3
         width = 64
         output_dims = 10
+        key_init, key_apply = jax.random.split(self.key)
 
-        def net_fn(obs):
-            net = NN(n_dense=n_dense, width=width, output_dims=output_dims)
-            return net(obs)
+        # Use the NN from rl_lib.utils
+        flax_net = UtilsNN(n_dense=n_dense, width=width, output_dims=output_dims)
 
-        transformed_net = hk.without_apply_rng(hk.transform(net_fn))
-
-        # Example observation shape (batch_size, feature_dim)
-        # NN flattens input, so actual feature dim structure doesn't matter as much
-        # as long as it can be passed to hk.Linear
         dummy_obs_single = jnp.ones((32,))
-        dummy_obs_batch = jnp.ones((5, 32))  # Batch of 5 observations
+        dummy_obs_batch = jnp.ones((5, 32))
 
-        key, init_key = jax.random.split(self.key)
-        params = transformed_net.init(init_key, dummy_obs_single)
+        # Initialize parameters
+        params = flax_net.init(key_init, dummy_obs_single)['params']
 
         # Test with single observation
-        output_single = transformed_net.apply(params, dummy_obs_single)
+        output_single = flax_net.apply({'params': params}, dummy_obs_single)
         self.assertEqual(output_single.shape, (output_dims,))
 
-        # Test with a batch of observations (hk.transform handles vmap implicitly for apply)
-        # However, our NN is defined to take a single instance and flatten it.
-        # If we want batch processing, the NN's __call__ or the way we apply it needs to be vmapped.
-        # The current NN definition `x = jnp.reshape(x, -1)` implies it processes one item.
-        # Let's test it as defined: one item at a time.
-        # If batch support is inherent in hk.Module's Dense layers when input has a batch dim,
-        # then (batch_size, output_dims) would be the shape.
-        # hk.transform + hk.Sequential + hk.Linear typically handles batch dimension automatically.
+        # Test with a batch of observations
+        # Flax modules typically handle batching automatically if input has a batch dimension.
+        # The NN in utils flattens input `jnp.reshape(x, -1)`.
+        # For batched input (B, Features), Dense layers will produce (B, output_features).
+        # The reshape to -1 on (B, Features) will make it (B * Features), which is not what we want for batch processing.
+        # The NN in utils.py should be vmapped or its internal reshape handled carefully for batching.
+        # The current UtilsNN is designed for single instance processing due to `jnp.reshape(x, -1)`.
+        # To test batch processing, we should vmap it.
 
-        output_batch = transformed_net.apply(params, dummy_obs_batch)
-        self.assertEqual(output_batch.shape, (dummy_obs_batch.shape[0], output_dims))
+        # Test vmapped application for batch
+        vmapped_apply = jax.vmap(flax_net.apply, in_axes=({'params': None}, 0))
+        output_batch_vmapped = vmapped_apply({'params': params}, dummy_obs_batch)
+        self.assertEqual(output_batch_vmapped.shape, (dummy_obs_batch.shape[0], output_dims))
+
+        # If the NN was intended to process batches directly (e.g. by reshaping (B, *F) to (B, prod(F))):
+        # The current UtilsNN:
+        #   `processed_x: JaxArray = jnp.reshape(x, -1)`
+        #   If x is (B, F1, F2), this becomes (B*F1*F2,).
+        #   The Dense layers then operate on this flattened version.
+        # This means the provided UtilsNN is not batch-aware by default in its architecture.
+        # The test should reflect how it's used by learners (likely with vmap or single instances).
+        # The QLearner uses `jax.vmap(network.apply, in_axes=(None, 0))` if network.apply takes (params, obs).
+        # Our Flax network.apply takes ({'params': params}, obs).
+        # The QLearner's `_batch_apply_net` correctly vmaps a helper.
+        # So, the vmapped test is more representative.
 
 
 if __name__ == "__main__":

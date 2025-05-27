@@ -18,60 +18,62 @@ class TestTDOperators(parameterized.TestCase):
         super().setUp()
         self.key = jax.random.PRNGKey(0)
 
-        # Common data for tests
-        # T = 2 (sequence length for rlax.q_lambda which processes T transitions)
-        # Thus, Q-value arrays (q_s, target_qs) often have T+1 elements
+        # T = 2 (number of transitions)
         self.T = 2
         self.num_actions = 2
 
-        # q_s: Q-values at current steps s_t, s_{t+1}, s_{t+2}
-        # Shape (T+1, num_actions) = (3, 2)
-        self.q_s = jnp.array(
+        # q_s_full: Q-values at s_t for t=0,1,2. Shape (T+1, num_actions) = (3, 2)
+        # Q(s_0), Q(s_1), Q(s_2)
+        self.q_s_full = jnp.array(
             [
-                [1.0, 1.2],  # Q(s_t, a)
-                [2.0, 2.2],  # Q(s_{t+1}, a)
-                [3.0, 3.2],  # Q(s_{t+2}, a) - for bootstrapping last step of q_lambda
+                [1.0, 1.2],
+                [2.0, 2.2],
+                [3.0, 3.2],
             ],
             dtype=jnp.float32,
         )
 
-        # target_qs: Q-values at next steps, typically from a target network
-        # Shape (T+1, num_actions) = (3, 2)
-        self.target_qs = jnp.array(
+        # target_qs_full: Target Q-values at s_t for t=0,1,2. Shape (T+1, num_actions) = (3, 2)
+        # TargetQ(s_0), TargetQ(s_1), TargetQ(s_2)
+        self.target_qs_full = jnp.array(
             [
-                [
-                    1.1,
-                    1.3,
-                ],  # Target Q(s_t, a) - not directly used by q_lambda for this q_s
-                [2.1, 2.3],  # Target Q(s_{t+1}, a)
-                [3.1, 3.3],  # Target Q(s_{t+2}, a)
+                [1.1, 1.3],
+                [2.1, 2.3],
+                [3.1, 3.3],
             ],
             dtype=jnp.float32,
         )
 
-        # a_s: Actions taken at s_t, s_{t+1}
+        # a_s: Actions taken at s_t for t=0,1 (a_0, a_1)
         # Shape (T,) = (2,)
-        self.a_s = jnp.array([0, 1], dtype=jnp.int32)
+        self.a_s_sequence = jnp.array([0, 1], dtype=jnp.int32)
 
-        # r_s: Rewards received for (s_t, a_t) -> r_{t+1} and (s_{t+1}, a_{t+1}) -> r_{t+2}
+        # r_s: Rewards r_{t+1} for t=0,1 (r_1, r_2)
         # Shape (T,) = (2,)
-        self.r_s = jnp.array([0.5, 0.8], dtype=jnp.float32)
+        self.r_s_sequence = jnp.array([0.5, 0.8], dtype=jnp.float32)
 
-        # discount_s: Discounts for transitions starting at s_t, s_{t+1}
+        # discount_s: Discounts d_{t+1} for t=0,1 (d_1, d_2)
         # Shape (T,) = (2,)
-        self.discount_s = jnp.array([0.99, 0.99], dtype=jnp.float32)
+        self.discount_s_sequence = jnp.array([0.99, 0.99], dtype=jnp.float32)
 
         self.kappa = 1.0
         self._lambda_param = 0.7
 
+        # Inputs for soft_watkins (T transitions):
+        # q_s_input: Q(s_0), Q(s_1) -> self.q_s_full[:-1]
+        self.q_s_input = self.q_s_full[:-1]  # Shape (T, num_actions)
+        # target_qs_input: TargetQ(s_1), TargetQ(s_2) -> self.target_qs_full[1:]
+        self.target_qs_input = self.target_qs_full[1:]  # Shape (T, num_actions)
+
+
     def test_soft_watkins_basic_case(self):
         """Tests basic invocation of soft_watkins for shape and type."""
         td_errors = soft_watkins(
-            q_s=self.q_s,
-            a_s=self.a_s,
-            r_s=self.r_s,
-            discount_s=self.discount_s,
-            target_qs=self.target_qs,
+            q_s=self.q_s_input,
+            a_s=self.a_s_sequence,
+            r_s=self.r_s_sequence,
+            discount_s=self.discount_s_sequence,
+            target_qs=self.target_qs_input,
             kappa=self.kappa,
             _lambda=self._lambda_param,
         )
@@ -84,60 +86,32 @@ class TestTDOperators(parameterized.TestCase):
         _lambda_zero = 0.0
 
         td_errors_sw_lambda_zero = soft_watkins(
-            q_s=self.q_s,
-            a_s=self.a_s,
-            r_s=self.r_s,
-            discount_s=self.discount_s,
-            target_qs=self.target_qs,
+            q_s=self.q_s_input,
+            a_s=self.a_s_sequence,
+            r_s=self.r_s_sequence,
+            discount_s=self.discount_s_sequence,
+            target_qs=self.target_qs_input,
             kappa=self.kappa,
             _lambda=_lambda_zero,
         )
 
-        # Calculate expected 1-step TD errors using rlax.q_learning for reference
-        # q_s[:-1] are the Q-values for s_t, s_{t+1}
-        # a_s are actions at s_t, s_{t+1}
-        # r_s are rewards r_{t+1}, r_{t+2}
-        # discount_s are discounts d_{t+1}, d_{t+2}
-        # target_qs[1:] are the Q-values for s_{t+1}, s_{t+2} from the target network
+        # Calculate expected 1-step TD errors using rlax.q_learning
+        # q_tm1 = self.q_s_input (Q-values at s_0, s_1)
+        # a_t = self.a_s_sequence (actions at s_0, s_1)
+        # r_t = self.r_s_sequence (rewards r_1, r_2)
+        # discount_t = self.discount_s_sequence (discounts d_1, d_2)
+        # q_t = self.target_qs_input (Target Q-values at s_1, s_2)
 
-        # Note: rlax.q_learning expects:
-        # q_tm1: Q-values at state s_t. Shape: (B, A) or (A,).
-        # a_t: Action taken at state s_t. Shape: (B,) or ().
-        # r_t: Reward received after action a_t. Shape: (B,) or ().
-        # discount_t: Discount received after action a_t. Shape: (B,) or ().
-        # q_t: Q-values at state s_{t+1}. Shape: (B, A) or (A,).
-
-        # For the first transition (t=0):
-        # q_tm1 = self.q_s[0] -> Q(s_0, a)
-        # a_t = self.a_s[0] -> a_0
-        # r_t = self.r_s[0] -> r_1
-        # discount_t = self.discount_s[0] -> d_1
-        # q_t = self.target_qs[1] -> Target Q(s_1, a)
-
-        # For the second transition (t=1):
-        # q_tm1 = self.q_s[1] -> Q(s_1, a)
-        # a_t = self.a_s[1] -> a_1
-        # r_t = self.r_s[1] -> r_2
-        # discount_t = self.discount_s[1] -> d_2
-        # q_t = self.target_qs[2] -> Target Q(s_2, a)
-
-        # So, we need to align inputs for a batched call to rlax.q_learning
-        q_tm1_for_q_learning = self.q_s[:-1]  # Q(s_t) for t=0,1. Shape (2, 2)
-        a_t_for_q_learning = self.a_s  # a_t for t=0,1. Shape (2,)
-        r_t_for_q_learning = self.r_s  # r_{t+1} for t=0,1. Shape (2,)
-        discount_t_for_q_learning = self.discount_s  # d_{t+1} for t=0,1. Shape (2,)
-        q_t_for_q_learning = self.target_qs[
-            1:
-        ]  # Target Q(s_{t+1}) for t=0,1. Shape (2, 2)
-
-        # rlax.q_learning returns (target - q_selected_action)
-        # target = r_t + discount_t * max_a Q_target(s_{t+1}, a)
-        expected_one_step_td_errors = rlax.q_learning(
-            q_tm1_for_q_learning,
-            a_t_for_q_learning,
-            r_t_for_q_learning,
-            discount_t_for_q_learning,
-            q_t_for_q_learning,
+        # Vmap rlax.q_learning as it expects unbatched ranks for its core assertion.
+        q_learning_fn_vmapped = jax.vmap(
+            rlax.q_learning, in_axes=(0, 0, 0, 0, 0) # q_tm1, a_t, r_t, discount_t, q_t
+        )
+        expected_one_step_td_errors = q_learning_fn_vmapped(
+            self.q_s_input,
+            self.a_s_sequence,
+            self.r_s_sequence,
+            self.discount_s_sequence,
+            self.target_qs_input,
         )
 
         self.assertIsInstance(td_errors_sw_lambda_zero, jax.Array)

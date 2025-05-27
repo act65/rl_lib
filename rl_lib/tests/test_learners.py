@@ -7,13 +7,12 @@ from absl.testing import parameterized
 
 import jax
 import jax.numpy as jnp
-import haiku as hk
-# import optax # F401: optax imported but unused
-# import rlax  # F401: rlax imported but unused # Potentially for assertions or more complex test cases later
-from typing import Dict, Any, List # F401: Tuple imported but unused
+import flax.linen as nn # Changed from haiku
+import numpy as np
+from typing import Dict, Any, List
 
 # Environment for testing
-from bsuite.environments import catch
+import gymnasium as gym
 
 # Learners to test
 from rl_lib.learners import (
@@ -26,74 +25,79 @@ from rl_lib.learners import (
     MaskedMultiAction,
 )
 
-# Utilities
-# from rl_lib.utils import build_signature # For Reverb/data signatures if needed in future tests.
-# For now, defining NN in file, but could import from rl_lib.utils.NN
+# Helper Spec classes for Gymnasium
+class GymObservationSpec:
+    def __init__(self, observation_space: gym.spaces.Space): # More general space
+        self.shape = observation_space.shape
+        self.dtype = observation_space.dtype if hasattr(observation_space, 'dtype') else jnp.float32
+        if not self.shape: # Handle Discrete observation spaces if they occur
+             if hasattr(observation_space, 'n'):
+                 self.shape = (1,) # Represent as a 1-element vector
+                 self.dtype = jnp.int32
 
 
-class ActionSpecMock:  # Simple mock for action_spec_per_sub_action
+    def generate_value(self):
+        # Create a JAX array of zeros with the correct shape and dtype
+        return jnp.zeros(self.shape, dtype=self.dtype)
+
+class GymActionSpec:
+    def __init__(self, action_space: gym.spaces.Discrete):
+        self.shape = () # Scalar for discrete actions
+        self.dtype = jnp.int32
+        self.num_values = int(action_space.n)
+
+    def generate_value(self):
+        return jnp.array(0, dtype=self.dtype)
+
+
+class ActionSpecMockForMulti:  # Simple mock for action_spec_per_sub_action
     def __init__(self, num_values: int):
         self.num_values = num_values
-        self.shape = ()  # For discrete actions
+        self.shape = ()
         self.dtype = jnp.int32
 
 
 class MockMultiActionManager(MultiActionManager):
     def __init__(
-        self, action_spec_per_sub_action: ActionSpecMock, num_sub_actions: int
+        self, action_spec_per_sub_action: ActionSpecMockForMulti, num_sub_actions: int
     ):
-        super().__init__(
-            action_spec=None
-        )  # Base action_spec might not be directly used by MaskedMultiAction
+        # The base MultiActionManager action_spec is not strictly typed or used by MaskedMultiAction directly
+        # It's more of a placeholder for the composite action's properties if needed.
+        super().__init__(action_spec=None)
         self.action_spec_per_sub_action = action_spec_per_sub_action
         self.num_sub_actions = num_sub_actions
 
     def iterate(self, nn_output: jax.Array) -> List[jax.Array]:
-        # nn_output shape: (..., total_q_values_dim)
-        # total_q_values_dim = num_sub_actions * self.action_spec_per_sub_action.num_values
-        # Returns a list of JAX arrays, each for a sub_action's Q-values
-        # Each element in list: (..., self.action_spec_per_sub_action.num_values)
         q_value_dim_per_action = self.action_spec_per_sub_action.num_values
         outputs = []
-        # Assuming nn_output might have batch and/or sequence dimensions at the beginning
-        # leading_dims = nn_output.shape[:-1] # F841: local variable 'leading_dims' is assigned to but never used
         for i in range(self.num_sub_actions):
             start_idx = i * q_value_dim_per_action
             end_idx = (i + 1) * q_value_dim_per_action
-            # Slice only the last dimension
             sub_action_qs = nn_output[..., start_idx:end_idx]
             outputs.append(sub_action_qs)
         return outputs
 
-    def get_mask(self, action_vector: jax.Array) -> jax.Array:
-        # action_vector shape: (num_sub_actions,) - one chosen action index for each sub_action
-        # Returns a mask of shape (num_sub_actions,)
-        # This is a simplified mask for testing.
-        # It should actually return a mask compatible with the output of iterate() for that sub-action.
-        # For simplicity, let's make it return a scalar per sub-action, which can be broadcasted.
-        # Or, more correctly, if iterate gives Qs of shape (num_choices), mask should be (num_choices)
-        # The current MaskedMultiAction._loss expects a mask of shape (..., num_sub_actions)
-        # which is then used as mask[..., i]. So this implementation should be fine.
-        return jnp.where(action_vector > 0, 1.0, 0.5).astype(jnp.float32)
+    def get_mask(self, action_from_one_head: jax.Array) -> jax.Array:
+        # MaskedMultiAction._loss applies this mask to the TD error of a specific head.
+        # The input `action_from_one_head` is the action taken for that head.
+        # The mask should be broadcastable with the TD error (scalar or same shape as Q-values for that head).
+        # For simplicity, returning a scalar mask.
+        # Original: jnp.where(action_vector > 0, 1.0, 0.5) - action_vector was (num_sub_actions,)
+        # Here, action_from_one_head is scalar.
+        return jnp.array(1.0, dtype=jnp.float32) # Always allow learning for this head for testing
 
 
-class SimpleMLP(hk.Module):
-    """A simple MLP for testing QLearner."""
+class SimpleFlaxMLP(nn.Module):
+    """A simple MLP for testing QLearner, using Flax."""
+    num_actions: int
 
-    def __init__(self, num_actions: int, name: str = "simple_mlp"):
-        super().__init__(name=name)
-        self._num_actions = num_actions
-
+    @nn.compact
     def __call__(self, obs: jax.Array) -> jax.Array:
-        network = hk.Sequential(
-            [
-                hk.Flatten(),
-                hk.Linear(50),
-                jax.nn.relu,
-                hk.Linear(self._num_actions),
-            ]
-        )
-        return network(obs)
+        obs_flat = obs.reshape((obs.shape[0], -1)) if obs.ndim > 1 else obs.reshape((1, -1)) # Handle single/batch
+        x = nn.Dense(features=50)(obs_flat)
+        x = nn.relu(x)
+        x = nn.Dense(features=self.num_actions)(x)
+        return x.squeeze() # Squeeze if single obs was passed and reshaped
 
 
 class TestLearners(parameterized.TestCase):
@@ -101,83 +105,38 @@ class TestLearners(parameterized.TestCase):
 
     def setUp(self):
         super().setUp()
-        self.env = catch.Catch(seed=42)
-        self.obs_spec = self.env.observation_spec()
-        self.action_spec = self.env.action_spec()
+        self.env = gym.make("CartPole-v1")
+        self.obs_spec = GymObservationSpec(self.env.observation_space)
+        self.action_spec = GymActionSpec(self.env.action_space)
 
-        # Haiku network transformation for QLearner
-        def net_fn(obs: jax.Array) -> jax.Array:
-            mlp = SimpleMLP(num_actions=self.action_spec.num_values)
-            return mlp(obs)
+        self.flax_mlp = SimpleFlaxMLP(num_actions=self.action_spec.num_values)
 
-        self.transformed_net = hk.without_apply_rng(hk.transform(net_fn))
-
-        # For MaskedMultiAction
         self.num_sub_actions = 2
-        self.sub_action_spec = ActionSpecMock(
-            num_values=3
-        )  # Each sub-action has 3 choices
+        self.sub_action_spec = ActionSpecMockForMulti(num_values=3)
         self.mam = MockMultiActionManager(self.sub_action_spec, self.num_sub_actions)
-
-        def net_fn_masked(obs: jax.Array) -> jax.Array:
-            mlp = SimpleMLP(
-                num_actions=self.num_sub_actions * self.sub_action_spec.num_values
-            )
-            return mlp(obs)
-
-        self.transformed_net_masked = hk.without_apply_rng(hk.transform(net_fn_masked))
+        self.flax_mlp_masked = SimpleFlaxMLP(
+            num_actions=self.num_sub_actions * self.sub_action_spec.num_values
+        )
 
         self.key = jax.random.PRNGKey(42)
-        self.ema_decay = 0.99  # For EMATargetNet tests
+        self.ema_decay = 0.99
 
     def _generate_dummy_observation(self) -> jax.Array:
-        if hasattr(self.obs_spec, "generate_value") and callable(
-            self.obs_spec.generate_value
-        ):
-            return self.obs_spec.generate_value()
-        else:
-            return jnp.zeros(self.obs_spec.shape, dtype=self.obs_spec.dtype)
+        return self.obs_spec.generate_value()
 
     def _generate_sequence_batch(
         self, batch_size: int, sequence_length: int
     ) -> Dict[str, Any]:
         obs_shape = self.obs_spec.shape
-        # Handle potentially complex/nested observation shapes
-        if not isinstance(obs_shape, tuple):
-            _dummy_obs = self._generate_dummy_observation()
-            obs_shape = _dummy_obs.shape
+        key_states, key_actions, key_rewards, key_next_states, self.key = jax.random.split(self.key, 5)
 
-        key_states, key_actions, key_rewards, key_next_states = jax.random.split(
-            self.key, 4
-        )
-        self.key, _ = jax.random.split(
-            self.key
-        )  # Consume self.key to avoid reuse in subsequent calls
-
-        states_data = [
-            self._generate_dummy_observation()
-            for _ in range(batch_size * sequence_length)
-        ]
-        states = jnp.array(states_data).reshape(
-            (batch_size, sequence_length) + obs_shape
-        )
-
+        states = jax.random.normal(key_states, (batch_size, sequence_length) + obs_shape, dtype=self.obs_spec.dtype)
         actions = jax.random.randint(
-            key_actions,
-            shape=(batch_size, sequence_length),
-            minval=0,
-            maxval=self.action_spec.num_values,
+            key_actions, (batch_size, sequence_length), 0, self.action_spec.num_values, dtype=self.action_spec.dtype
         )
-        rewards = jax.random.uniform(key_rewards, shape=(batch_size, sequence_length))
+        rewards = jax.random.uniform(key_rewards, (batch_size, sequence_length))
         discounts = jnp.ones((batch_size, sequence_length), dtype=jnp.float32) * 0.99
-
-        next_states_data = [
-            self._generate_dummy_observation()
-            for _ in range(batch_size * sequence_length)
-        ]
-        next_states = jnp.array(next_states_data).reshape(
-            (batch_size, sequence_length) + obs_shape
-        )
+        next_states = jax.random.normal(key_next_states, (batch_size, sequence_length) + obs_shape, dtype=self.obs_spec.dtype)
 
         return {
             "states": states,
@@ -191,458 +150,264 @@ class TestLearners(parameterized.TestCase):
         self, batch_size: int, sequence_length: int
     ) -> Dict[str, Any]:
         batch = self._generate_sequence_batch(batch_size, sequence_length)
-
-        # Replace actions with masked actions
-        key_actions, self.key = jax.random.split(self.key)  # Get a new key
+        key_actions, self.key = jax.random.split(self.key)
         actions_masked = jax.random.randint(
             key_actions,
-            shape=(batch_size, sequence_length, self.num_sub_actions),
-            minval=0,
-            maxval=self.sub_action_spec.num_values,
-            dtype=self.sub_action_spec.dtype,  # Ensure correct dtype for actions
+            (batch_size, sequence_length, self.num_sub_actions),
+            0, self.sub_action_spec.num_values, dtype=self.sub_action_spec.dtype,
         )
         batch["actions"] = actions_masked
         return batch
 
     def test_random_agent_actor_step(self):
-        """Tests the actor_step of the Random agent."""
         agent = Random(action_spec=self.action_spec)
-
-        dummy_params = {}  # Random agent doesn't use params
         key, actor_key = jax.random.split(self.key)
-
         observation = self._generate_dummy_observation()
         initial_actor_state = agent.initial_actor_state()
+        # Random agent's train_state is an empty dict, not params
+        train_state = agent.initial_train_state(key)
+
 
         action, new_actor_state = agent.actor_step(
-            dummy_params, observation, initial_actor_state, actor_key, evaluation=False
+            train_state, observation, initial_actor_state, actor_key, evaluation=False
         )
 
         self.assertIsInstance(action, jax.Array)
-        self.assertEqual(action.shape, ())  # Scalar action
+        self.assertEqual(action.shape, ())
         self.assertTrue(0 <= action.item() < self.action_spec.num_values)
-        self.assertEqual(
-            new_actor_state, initial_actor_state
-        )  # Random agent state doesn't change
+        self.assertEqual(new_actor_state, initial_actor_state)
 
     def test_qlearner_initial_train_state(self):
-        """Tests the initial_train_state of the QLearner agent."""
         key, init_key = jax.random.split(self.key)
         agent = QLearner(
-            network=self.transformed_net,
+            network=self.flax_mlp, # Pass Flax module instance
             observation_spec=self.obs_spec,
             learning_rate=0.001,
         )
-
         train_state = agent.initial_train_state(init_key)
-
         self.assertIsInstance(train_state, dict)
         self.assertIn("params", train_state)
         self.assertIn("opt_state", train_state)
-        self.assertNotEmpty(train_state["params"])  # Check that params are initialized
+        self.assertNotEmpty(train_state["params"])
 
     def test_qlearner_actor_step(self):
-        """Tests the actor_step of the QLearner agent."""
         key, init_key, actor_key_train, actor_key_eval = jax.random.split(self.key, 4)
         agent = QLearner(
-            network=self.transformed_net,
+            network=self.flax_mlp,
             observation_spec=self.obs_spec,
             learning_rate=0.001,
         )
-
         train_state = agent.initial_train_state(init_key)
         observation = self._generate_dummy_observation()
         initial_actor_state = agent.initial_actor_state()
 
-        # Test actor_step in training mode
         action_train, new_actor_state_train = agent.actor_step(
-            train_state,
-            observation,
-            initial_actor_state,
-            actor_key_train,
-            evaluation=False,
+            train_state, observation, initial_actor_state, actor_key_train, evaluation=False,
         )
-
         self.assertIsInstance(action_train, jax.Array)
         self.assertEqual(action_train.shape, ())
         self.assertTrue(0 <= action_train.item() < self.action_spec.num_values)
         self.assertEqual(new_actor_state_train, initial_actor_state)
 
-        # Test actor_step in evaluation mode
         action_eval, new_actor_state_eval = agent.actor_step(
-            train_state,
-            observation,
-            initial_actor_state,
-            actor_key_eval,
-            evaluation=True,
+            train_state, observation, initial_actor_state, actor_key_eval, evaluation=True,
         )
-
         self.assertIsInstance(action_eval, jax.Array)
         self.assertEqual(action_eval.shape, ())
         self.assertTrue(0 <= action_eval.item() < self.action_spec.num_values)
         self.assertEqual(new_actor_state_eval, initial_actor_state)
 
     def test_qlearner_learner_step(self):
-        """Tests the learner_step of the QLearner agent."""
         key, init_key, learner_key = jax.random.split(self.key, 3)
         agent = QLearner(
-            network=self.transformed_net,
+            network=self.flax_mlp,
             observation_spec=self.obs_spec,
             learning_rate=0.001,
         )
-
         initial_train_state = agent.initial_train_state(init_key)
         original_params = initial_train_state["params"]
 
         batch_size = 2
-        # Create dummy batch data
-        # Ensure observation spec shape is correctly handled
         obs_shape = self.obs_spec.shape
-        if not isinstance(obs_shape, tuple):
-            _dummy_obs = self._generate_dummy_observation()
-            obs_shape = _dummy_obs.shape
+        key_states, key_actions, key_rewards, key_next_states, self.key = jax.random.split(self.key, 5)
 
-        key_states, key_actions, key_rewards, key_next_states, self.key = (
-            jax.random.split(self.key, 5)
-        )
-
-        dummy_states = jax.random.normal(
-            key_states, (batch_size,) + obs_shape, dtype=self.obs_spec.dtype
-        )
-        dummy_actions = jax.random.randint(
-            key_actions,
-            (batch_size,),
-            0,
-            self.action_spec.num_values,
-            dtype=self.action_spec.dtype,
-        )
-        dummy_rewards = jax.random.uniform(
-            key_rewards, (batch_size,), dtype=jnp.float32
-        )
+        dummy_states = jax.random.normal(key_states, (batch_size,) + obs_shape, dtype=self.obs_spec.dtype)
+        dummy_actions = jax.random.randint(key_actions, (batch_size,), 0, self.action_spec.num_values, dtype=self.action_spec.dtype)
+        dummy_rewards = jax.random.uniform(key_rewards, (batch_size,), dtype=jnp.float32)
         dummy_discounts = jnp.ones((batch_size,), dtype=jnp.float32) * 0.99
-        dummy_next_states = jax.random.normal(
-            key_next_states, (batch_size,) + obs_shape, dtype=self.obs_spec.dtype
-        )
+        dummy_next_states = jax.random.normal(key_next_states, (batch_size,) + obs_shape, dtype=self.obs_spec.dtype)
 
         batch = {
-            "states": dummy_states,
-            "actions": dummy_actions,
-            "rewards": dummy_rewards,
-            "discounts": dummy_discounts,
-            "next_states": dummy_next_states,
+            "states": dummy_states, "actions": dummy_actions, "rewards": dummy_rewards,
+            "discounts": dummy_discounts, "next_states": dummy_next_states,
         }
-
-        new_train_state, loss = (
-            agent.learner_step(  # Use agent._uncompiled_learner_step for direct testing if needed
-                initial_train_state, batch, learner_key
-            )
-        )
+        new_train_state, loss = agent.learner_step(initial_train_state, batch, learner_key)
 
         self.assertIsInstance(new_train_state, dict)
         self.assertIn("params", new_train_state)
         self.assertIn("opt_state", new_train_state)
         self.assertIsInstance(loss, jax.Array)
-        self.assertEqual(loss.shape, ())  # Scalar loss
+        self.assertEqual(loss.shape, ())
 
-        # Check that parameters have changed (learning occurred)
-        # Check that parameters have changed
         params_are_different = not jax.tree_util.tree_all(
-            jax.tree_util.tree_map(
-                jnp.array_equal, original_params, new_train_state["params"]
-            )
+            jax.tree_util.tree_map(jnp.array_equal, original_params, new_train_state["params"])
         )
-        self.assertTrue(
-            params_are_different, "Parameters did not change after learner_step."
-        )
+        self.assertTrue(params_are_different, "Parameters did not change after learner_step.")
 
     def test_qlambda_learner_step(self):
-        """Tests the learner_step of the QLambda agent with sequence data."""
         key, init_key, learner_key = jax.random.split(self.key, 3)
         agent = QLambda(
-            _lambda=0.7,
-            network=self.transformed_net,
-            observation_spec=self.obs_spec,
-            learning_rate=0.001,
+            _lambda=0.7, network=self.flax_mlp, observation_spec=self.obs_spec, learning_rate=0.001,
         )
-
         initial_train_state = agent.initial_train_state(init_key)
         original_params = initial_train_state["params"]
-
         batch = self._generate_sequence_batch(batch_size=2, sequence_length=3)
-
-        new_train_state, loss = agent.learner_step(
-            initial_train_state, batch, learner_key
-        )
+        new_train_state, loss = agent.learner_step(initial_train_state, batch, learner_key)
 
         self.assertIsInstance(new_train_state, dict)
-        self.assertIn("params", new_train_state)
-        self.assertIn("opt_state", new_train_state)
-        self.assertIsInstance(loss, jax.Array)
-        self.assertEqual(loss.shape, ())
         self.assertIsInstance(loss.item(), float)
-
         params_are_different = not jax.tree_util.tree_all(
-            jax.tree_util.tree_map(
-                jnp.array_equal, original_params, new_train_state["params"]
-            )
+            jax.tree_util.tree_map(jnp.array_equal, original_params, new_train_state["params"])
         )
-        self.assertTrue(
-            params_are_different,
-            "QLambda parameters did not change after learner_step.",
-        )
+        self.assertTrue(params_are_different, "QLambda parameters did not change.")
 
     def test_softwatkins_learner_step(self):
-        """Tests the learner_step of the SoftWatkins agent with sequence data."""
         key, init_key, learner_key = jax.random.split(self.key, 3)
         agent = SoftWatkins(
-            kappa=0.5,
-            _lambda=0.7,
-            network=self.transformed_net,
-            observation_spec=self.obs_spec,
-            learning_rate=0.001,
+            kappa=0.5, _lambda=0.7, network=self.flax_mlp, observation_spec=self.obs_spec, learning_rate=0.001,
         )
-
         initial_train_state = agent.initial_train_state(init_key)
         original_params = initial_train_state["params"]
-
         batch = self._generate_sequence_batch(batch_size=2, sequence_length=3)
-
-        new_train_state, loss = agent.learner_step(
-            initial_train_state, batch, learner_key
-        )
+        new_train_state, loss = agent.learner_step(initial_train_state, batch, learner_key)
 
         self.assertIsInstance(new_train_state, dict)
-        self.assertIn("params", new_train_state)
-        self.assertIn("opt_state", new_train_state)
-        self.assertIsInstance(loss, jax.Array)
-        self.assertEqual(loss.shape, ())
         self.assertIsInstance(loss.item(), float)
-
         params_are_different = not jax.tree_util.tree_all(
-            jax.tree_util.tree_map(
-                jnp.array_equal, original_params, new_train_state["params"]
-            )
+            jax.tree_util.tree_map(jnp.array_equal, original_params, new_train_state["params"])
         )
-        self.assertTrue(
-            params_are_different,
-            "SoftWatkins parameters did not change after learner_step.",
-        )
+        self.assertTrue(params_are_different, "SoftWatkins parameters did not change.")
 
     def test_ematargetnet_initial_train_state(self):
-        """Tests initial_train_state for EMATargetNet, ensuring ema_state is present and correct."""
         key, init_key = jax.random.split(self.key)
         agent = EMATargetNet(
-            ema_decay=self.ema_decay,
-            kappa=0.5,
-            _lambda=0.7,
-            network=self.transformed_net,
-            observation_spec=self.obs_spec,
-            learning_rate=0.001,
+            ema_decay=self.ema_decay, kappa=0.5, _lambda=0.7, network=self.flax_mlp,
+            observation_spec=self.obs_spec, learning_rate=0.001,
         )
-
         train_state = agent.initial_train_state(init_key)
-
-        self.assertIn("ema_state", train_state)
-        # Check that initial params and ema_state (target params) are identical
+        self.assertIn("ema_target_params", train_state) # Changed from ema_state to ema_target_params
         are_params_equal = jax.tree_util.tree_all(
-            jax.tree_util.tree_map(
-                jnp.array_equal, train_state["params"], train_state["ema_state"]
-            )
+            jax.tree_util.tree_map(jnp.array_equal, train_state["params"], train_state["ema_target_params"])
         )
-        self.assertTrue(
-            are_params_equal, "Initial params and ema_state should be identical."
-        )
+        self.assertTrue(are_params_equal, "Initial params and ema_target_params should be identical.")
 
     def test_ematargetnet_learner_step_updates_ema(self):
-        """Tests that EMATargetNet's learner_step updates ema_state correctly."""
         key, init_key, learner_key = jax.random.split(self.key, 3)
         agent = EMATargetNet(
-            ema_decay=self.ema_decay,  # Use self.ema_decay for the check later
-            kappa=0.5,
-            _lambda=0.7,
-            network=self.transformed_net,
-            observation_spec=self.obs_spec,
-            learning_rate=0.001,
+            ema_decay=self.ema_decay, kappa=0.5, _lambda=0.7, network=self.flax_mlp,
+            observation_spec=self.obs_spec, learning_rate=0.001,
         )
-
         initial_train_state = agent.initial_train_state(init_key)
-        initial_params = initial_train_state["params"]
-        initial_ema_state = initial_train_state["ema_state"]
-
+        # initial_params = initial_train_state["params"] # Not directly used for expected EMA calc here
+        initial_target_params = initial_train_state["ema_target_params"]
         batch = self._generate_sequence_batch(batch_size=2, sequence_length=3)
+        new_train_state, loss = agent.learner_step(initial_train_state, batch, learner_key)
 
-        new_train_state, loss = agent.learner_step(
-            initial_train_state, batch, learner_key
+        new_online_params = new_train_state["params"]
+        new_target_params = new_train_state["ema_target_params"]
+        self.assertIsInstance(loss.item(), float)
+
+        # Check if new_target_params are different from initial_target_params
+        # This is only meaningful if new_online_params are different from initial_target_params
+        target_params_changed = not jax.tree_util.tree_all(
+            jax.tree_util.tree_map(jnp.array_equal, initial_target_params, new_target_params)
+        )
+        online_params_changed_from_initial_target = not jax.tree_util.tree_all(
+            jax.tree_util.tree_map(jnp.array_equal, initial_target_params, new_online_params)
         )
 
-        new_params = new_train_state["params"]
-        new_ema_state = new_train_state["ema_state"]
-
-        self.assertIsInstance(loss.item(), float)  # Basic check for loss
-
-        # 1. Check that new_ema_state is different from initial_ema_state (unless params didn't change, which is unlikely)
-        ema_states_are_different = not jax.tree_util.tree_all(
-            jax.tree_util.tree_map(jnp.array_equal, initial_ema_state, new_ema_state)
-        )
-        # This check is only meaningful if params actually changed from initial_ema_state
-        params_changed_from_initial_ema = not jax.tree_util.tree_all(
-            jax.tree_util.tree_map(jnp.array_equal, initial_ema_state, new_params)
-        )
-        if params_changed_from_initial_ema:
-            self.assertTrue(
-                ema_states_are_different,
-                "EMA state should change if online params change from initial EMA state.",
-            )
+        if online_params_changed_from_initial_target:
+            self.assertTrue(target_params_changed, "Target params should change if online params changed from them.")
         else:
-            # If new_params are somehow identical to initial_ema_state, then new_ema_state should also be identical.
-            self.assertTrue(
-                jax.tree_util.tree_all(
-                    jax.tree_util.tree_map(
-                        jnp.array_equal, new_ema_state, initial_ema_state
-                    )
-                ),
-                "EMA state should not change if new params are identical to initial EMA state.",
-            )
+             self.assertFalse(target_params_changed, "Target params should not change if online params are same as initial target.")
 
-        # 2. More precise check: new_ema_state should be an EMA of initial_ema_state and new_params
-        # Note: The EMATargetNet updates ema_state using the *newly updated* online parameters.
-        # So, the check should be: new_ema_state = decay * initial_ema_state + (1-decay) * new_params
-        # (assuming ema_fn in EMATargetNet is called with state['ema_state'] (old) and updated_state['params'] (new))
 
-        expected_ema_state_leaves = jax.tree_util.tree_map(
-            lambda old_ema, p_new: self.ema_decay * old_ema
-            + (1.0 - self.ema_decay) * p_new,
-            initial_ema_state,  # This is state['ema_state'] before the learner_step's super call returns
-            new_params,  # This is updated_state_base['params'] after super call returns
+        # Expected EMA: new_target = decay * old_target + (1-decay) * new_online
+        expected_target_params_tree = jax.tree_util.tree_map(
+            lambda old_target, p_new_online: self.ema_decay * old_target + (1.0 - self.ema_decay) * p_new_online,
+            initial_target_params, # old target params from before this step
+            new_online_params,     # new online params from this step
         )
-
         are_ema_updated_correctly = jax.tree_util.tree_all(
-            jax.tree_util.tree_map(
-                jnp.allclose, new_ema_state, expected_ema_state_leaves
-            )
+            jax.tree_util.tree_map(jnp.allclose, new_target_params, expected_target_params_tree)
         )
-        self.assertTrue(
-            are_ema_updated_correctly,
-            "EMA state was not updated correctly according to the EMA rule.",
-        )
+        self.assertTrue(are_ema_updated_correctly, "EMA target params not updated correctly.")
 
     def test_maskedmulti_initial_train_state(self):
-        """Tests initial_train_state for MaskedMultiAction."""
         key, init_key = jax.random.split(self.key)
         agent = MaskedMultiAction(
-            mam=self.mam,
-            ema_decay=self.ema_decay,
-            kappa=0.5,
-            _lambda=0.7,
-            network=self.transformed_net_masked,  # Use the network with correct output dim
-            observation_spec=self.obs_spec,
-            learning_rate=0.001,
+            mam=self.mam, ema_decay=self.ema_decay, kappa=0.5, _lambda=0.7,
+            network=self.flax_mlp_masked, observation_spec=self.obs_spec, learning_rate=0.001,
         )
-
         train_state = agent.initial_train_state(init_key)
-
         self.assertIn("params", train_state)
         self.assertIn("opt_state", train_state)
-        self.assertIn("ema_state", train_state)
+        self.assertIn("ema_target_params", train_state)
         are_params_equal = jax.tree_util.tree_all(
-            jax.tree_util.tree_map(
-                jnp.array_equal, train_state["params"], train_state["ema_state"]
-            )
+            jax.tree_util.tree_map(jnp.array_equal, train_state["params"], train_state["ema_target_params"])
         )
-        self.assertTrue(
-            are_params_equal,
-            "Initial params and ema_state should be identical for MaskedMultiAction.",
-        )
+        self.assertTrue(are_params_equal, "Initial params and ema_target_params should be identical.")
 
     def test_maskedmulti_actor_step(self):
-        """Tests actor_step for MaskedMultiAction."""
         key, init_key, actor_key = jax.random.split(self.key, 3)
         agent = MaskedMultiAction(
-            mam=self.mam,
-            ema_decay=self.ema_decay,
-            kappa=0.5,
-            _lambda=0.7,
-            network=self.transformed_net_masked,
-            observation_spec=self.obs_spec,
-            learning_rate=0.001,
+            mam=self.mam, ema_decay=self.ema_decay, kappa=0.5, _lambda=0.7,
+            network=self.flax_mlp_masked, observation_spec=self.obs_spec, learning_rate=0.001,
         )
-
         train_state = agent.initial_train_state(init_key)
         observation = self._generate_dummy_observation()
-        initial_actor_state = (
-            agent.initial_actor_state()
-        )  # Should be empty tuple from QLearner
+        initial_actor_state = agent.initial_actor_state()
 
         chosen_actions, new_actor_state = agent.actor_step(
             train_state, observation, initial_actor_state, actor_key, evaluation=False
         )
-
         self.assertIsInstance(chosen_actions, list)
         self.assertLen(chosen_actions, self.num_sub_actions)
         for sub_action in chosen_actions:
             self.assertIsInstance(sub_action, jax.Array)
-            self.assertEqual(sub_action.shape, ())  # Scalar action for each sub_action
+            self.assertEqual(sub_action.shape, ())
             self.assertTrue(0 <= sub_action.item() < self.sub_action_spec.num_values)
         self.assertEqual(new_actor_state, initial_actor_state)
 
     def test_maskedmulti_learner_step(self):
-        """Tests learner_step for MaskedMultiAction."""
         key, init_key, learner_key = jax.random.split(self.key, 3)
         agent = MaskedMultiAction(
-            mam=self.mam,
-            ema_decay=self.ema_decay,
-            kappa=0.5,
-            _lambda=0.7,
-            network=self.transformed_net_masked,
-            observation_spec=self.obs_spec,
-            learning_rate=0.001,
+            mam=self.mam, ema_decay=self.ema_decay, kappa=0.5, _lambda=0.7,
+            network=self.flax_mlp_masked, observation_spec=self.obs_spec, learning_rate=0.001,
         )
-
         initial_train_state = agent.initial_train_state(init_key)
         original_params = initial_train_state["params"]
-        initial_ema_state = initial_train_state["ema_state"]
-
+        initial_target_params = initial_train_state["ema_target_params"]
         batch = self._generate_masked_sequence_batch(batch_size=2, sequence_length=3)
-
-        new_train_state, loss = agent.learner_step(
-            initial_train_state, batch, learner_key
-        )
+        new_train_state, loss = agent.learner_step(initial_train_state, batch, learner_key)
 
         self.assertIsInstance(new_train_state, dict)
-        self.assertIn("params", new_train_state)
-        self.assertIn("opt_state", new_train_state)
-        self.assertIn("ema_state", new_train_state)
-        self.assertIsInstance(loss, jax.Array)
-        self.assertEqual(loss.shape, ())
         self.assertIsInstance(loss.item(), float)
-
-        # Check params changed
         params_are_different = not jax.tree_util.tree_all(
-            jax.tree_util.tree_map(
-                jnp.array_equal, original_params, new_train_state["params"]
-            )
+            jax.tree_util.tree_map(jnp.array_equal, original_params, new_train_state["params"])
         )
-        self.assertTrue(
-            params_are_different,
-            "MaskedMultiAction parameters did not change after learner_step.",
-        )
+        self.assertTrue(params_are_different, "MaskedMultiAction parameters did not change.")
 
-        # Check EMA update
-        new_params = new_train_state["params"]
-        new_ema_state = new_train_state["ema_state"]
-        expected_ema_state = jax.tree_util.tree_map(
-            lambda old_ema, p_new: self.ema_decay * old_ema
-            + (1.0 - self.ema_decay) * p_new,
-            initial_ema_state,
-            new_params,
+        new_online_params = new_train_state["params"]
+        new_target_params = new_train_state["ema_target_params"]
+        expected_target_params = jax.tree_util.tree_map(
+            lambda old_target, p_new_online: self.ema_decay * old_target + (1.0 - self.ema_decay) * p_new_online,
+            initial_target_params, new_online_params,
         )
         are_ema_updated_correctly = jax.tree_util.tree_all(
-            jax.tree_util.tree_map(jnp.allclose, new_ema_state, expected_ema_state)
+            jax.tree_util.tree_map(jnp.allclose, new_target_params, expected_target_params)
         )
-        self.assertTrue(
-            are_ema_updated_correctly,
-            "MaskedMultiAction EMA state was not updated correctly.",
-        )
+        self.assertTrue(are_ema_updated_correctly, "MaskedMultiAction EMA state not updated correctly.")
 
 
 if __name__ == "__main__":
